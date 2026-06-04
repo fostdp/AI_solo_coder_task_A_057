@@ -1,0 +1,111 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: power-grid-timescaledb
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-power_grid}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      TZ: Asia/Shanghai
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - timescaledb_data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-power_grid}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - power-grid-network
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=200
+      -c shared_buffers=1GB
+      -c effective_cache_size=3GB
+      -c maintenance_work_mem=256MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=4MB
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: power-grid-backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: ${PORT:-3001}
+      DB_HOST: timescaledb
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-power_grid}
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      STATIC_CAPACITY: ${STATIC_CAPACITY:-1000}
+      MAX_ALLOWED_TEMP: ${MAX_ALLOWED_TEMP:-70}
+      LINE_LENGTH_KM: ${LINE_LENGTH_KM:-200}
+      SENSOR_REPORT_INTERVAL: ${SENSOR_REPORT_INTERVAL:-10000}
+      VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:3001}
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
+      TZ: Asia/Shanghai
+    ports:
+      - "${PORT:-3001}:3001"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    networks:
+      - power-grid-network
+    volumes:
+      - ./config:/app/config:ro
+      - ./sql:/app/sql:ro
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3001/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:3001}
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
+    container_name: power-grid-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    networks:
+      - power-grid-network
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  timescaledb_data:
+    driver: local
+
+networks:
+  power-grid-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
