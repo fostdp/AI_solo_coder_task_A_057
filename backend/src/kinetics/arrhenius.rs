@@ -20,17 +20,24 @@ pub struct MichaelisMentenConfig {
 impl Default for MichaelisMentenConfig {
     fn default() -> Self {
         Self {
-            v_max: DEFAULT_VMAX,
-            km: DEFAULT_KM,
-            enzyme_concentration: DEFAULT_ENZYME_CONC,
-            substrate_initial: DEFAULT_SUBSTRATE_INIT,
-            enzyme_ea: 55_000.0,
-            enzyme_a: 8.0e8,
-            ph_optimum: 6.8,
-            ph_range: 1.5,
-            temp_optimum_celsius: 37.0,
+            v_max: env_or("MM_VMAX", DEFAULT_VMAX),
+            km: env_or("MM_KM", DEFAULT_KM),
+            enzyme_concentration: env_or("MM_ENZYME_CONC", DEFAULT_ENZYME_CONC),
+            substrate_initial: env_or("MM_SUBSTRATE_INIT", DEFAULT_SUBSTRATE_INIT),
+            enzyme_ea: env_or("MM_ENZYME_EA", 55_000.0),
+            enzyme_a: env_or("MM_ENZYME_A", 8.0e8),
+            ph_optimum: env_or("MM_PH_OPT", 6.8),
+            ph_range: env_or("MM_PH_RANGE", 1.5),
+            temp_optimum_celsius: env_or("MM_TEMP_OPT", 37.0),
         }
     }
+}
+
+fn env_or(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 pub fn michaelis_menten_rate(
