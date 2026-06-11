@@ -45,6 +45,7 @@ pub async fn health(db: web::Data<Database>) -> impl Responder {
 pub async fn lora_uplink(
     db: web::Data<Database>,
     alert_mgr: web::Data<AlertManager>,
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
     reading: web::Json<SensorReading>,
 ) -> impl Responder {
     let mut reading = reading.into_inner();
@@ -84,11 +85,15 @@ pub async fn lora_uplink(
                 let _ = db.write_corrosion_analysis(&analysis).await;
             }
 
+            let downlinks = gw.get_pending_for_device(&reading.sensor_id);
+
             let resp_data = serde_json::json!({
                 "received": true,
                 "sensor_id": reading.sensor_id,
                 "alerts_triggered": alerts.len(),
-                "alerts": alerts
+                "alerts": alerts,
+                "downlinks": downlinks,
+                "downlink_count": downlinks.len()
             });
             HttpResponse::Ok().json(ApiResponse::ok(resp_data, "LoRa数据已入库"))
         }
@@ -389,11 +394,141 @@ pub async fn stats_summary(
     HttpResponse::Ok().json(ApiResponse::ok(data, "系统统计汇总"))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct DownlinkRequest {
+    pub dev_eui: String,
+    pub command: String,
+    pub payload: serde_json::Value,
+}
+
+#[post("/api/lora/downlink")]
+pub async fn enqueue_downlink(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+    req: web::Json<DownlinkRequest>,
+) -> impl Responder {
+    use crate::lora_gateway::DownlinkCommand;
+
+    let cmd = match req.command.to_uppercase().as_str() {
+        "SET_SAMPLE_INTERVAL" => DownlinkCommand::SET_SAMPLE_INTERVAL,
+        "SET_THRESHOLDS" => DownlinkCommand::SET_THRESHOLDS,
+        "SET_TX_POWER" => DownlinkCommand::SET_TX_POWER,
+        "SET_DATARATE" => DownlinkCommand::SET_DATARATE,
+        "RESET_DEVICE" => DownlinkCommand::RESET_DEVICE,
+        "CALIBRATE" => DownlinkCommand::CALIBRATE,
+        "FIRMWARE_UPDATE" => DownlinkCommand::FIRMWARE_UPDATE,
+        "CONFIG_ACK" => DownlinkCommand::CONFIG_ACK,
+        "QUERY_STATUS" => DownlinkCommand::QUERY_STATUS,
+        _ => return HttpResponse::BadRequest().json(ApiResponse::<()>::error("未知命令类型")),
+    };
+
+    let fcnt = gw.enqueue(&req.dev_eui, cmd, req.payload.clone());
+    HttpResponse::Ok().json(ApiResponse::ok(
+        serde_json::json!({ "dev_eui": req.dev_eui, "fcnt": fcnt, "pending": gw.pending_count() }),
+        &format!("下行命令已入队，帧序号={}", fcnt)
+    ))
+}
+
+#[post("/api/lora/ack")]
+pub async fn receive_ack(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+    ack: web::Json<crate::lora_gateway::AckFrame>,
+) -> impl Responder {
+    let ok = gw.process_ack(&ack);
+    if ok {
+        HttpResponse::Ok().json(ApiResponse::ok(
+            serde_json::json!({ "processed": true, "remaining_pending": gw.pending_count() }),
+            "ACK处理成功"
+        ))
+    } else {
+        HttpResponse::NotFound().json(ApiResponse::<()>::error("未找到对应下行帧"))
+    }
+}
+
+#[get("/api/lora/downlink/pending")]
+pub async fn list_pending_downlinks(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+    q: web::Query<QueryParams>,
+) -> impl Responder {
+    let limit = q.limit.unwrap_or(50);
+    let list = gw.list_pending(limit);
+    let stats = gw.get_stats();
+    HttpResponse::Ok().json(ApiResponse::ok(
+        serde_json::json!({
+            "total_pending": gw.pending_count(),
+            "items": list,
+            "stats": stats,
+        }),
+        &format!("待确认下行帧共{}条", gw.pending_count())
+    ))
+}
+
+#[get("/api/lora/downlink/stats")]
+pub async fn downlink_stats(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+) -> impl Responder {
+    let stats = gw.get_stats();
+    HttpResponse::Ok().json(ApiResponse::ok(stats, "下行链路统计"))
+}
+
+#[get("/api/lora/downlink/for-device/{dev_eui}")]
+pub async fn get_downlink_for_device(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+    path: web::Path<String>,
+) -> impl Responder {
+    let dev_eui = path.into_inner();
+    let frames = gw.get_pending_for_device(&dev_eui);
+    HttpResponse::Ok().json(ApiResponse::ok(
+        serde_json::json!({ "dev_eui": dev_eui, "downlinks": frames, "count": frames.len() }),
+        &format!("返回{}条待发下行帧", frames.len())
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BatchDownlinkRequest {
+    pub devices: Vec<String>,
+    pub command: String,
+    pub payload: serde_json::Value,
+}
+
+#[post("/api/lora/downlink/batch")]
+pub async fn batch_enqueue_downlink(
+    gw: web::Data<crate::lora_gateway::LoraGateway>,
+    req: web::Json<BatchDownlinkRequest>,
+) -> impl Responder {
+    use crate::lora_gateway::DownlinkCommand;
+
+    let cmd = match req.command.to_uppercase().as_str() {
+        "SET_SAMPLE_INTERVAL" => DownlinkCommand::SET_SAMPLE_INTERVAL,
+        "SET_THRESHOLDS" => DownlinkCommand::SET_THRESHOLDS,
+        "SET_TX_POWER" => DownlinkCommand::SET_TX_POWER,
+        "SET_DATARATE" => DownlinkCommand::SET_DATARATE,
+        "RESET_DEVICE" => DownlinkCommand::RESET_DEVICE,
+        "CALIBRATE" => DownlinkCommand::CALIBRATE,
+        _ => return HttpResponse::BadRequest().json(ApiResponse::<()>::error("未知命令")),
+    };
+
+    let mut results = Vec::new();
+    for dev in &req.devices {
+        let fcnt = gw.enqueue(dev, cmd, req.payload.clone());
+        results.push(serde_json::json!({ "dev_eui": dev, "fcnt": fcnt }));
+    }
+    HttpResponse::Ok().json(ApiResponse::ok(
+        serde_json::json!({ "count": results.len(), "results": results }),
+        &format!("批量下发{}条下行命令", results.len())
+    ))
+}
+
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg
         .service(health)
         .service(lora_uplink)
         .service(lora_batch_uplink)
+        .service(enqueue_downlink)
+        .service(receive_ack)
+        .service(list_pending_downlinks)
+        .service(downlink_stats)
+        .service(get_downlink_for_device)
+        .service(batch_enqueue_downlink)
         .service(list_relics)
         .service(get_relic)
         .service(list_sensors)
