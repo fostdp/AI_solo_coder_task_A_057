@@ -1,7 +1,9 @@
 mod models;
 mod database;
 mod algorithms;
+mod kinetics;
 mod alerts;
+mod lora_gateway;
 mod handlers;
 
 use actix_web::{App, HttpServer, middleware, web};
@@ -67,6 +69,7 @@ async fn main() -> io::Result<()> {
             .wrap(cors)
             .app_data(db_data.clone())
             .app_data(alert_data.clone())
+            .app_data(gw_data.clone())
             .configure(handlers::configure_routes)
             .service(
                 fs::Files::new("/", frontend_dir.clone())
