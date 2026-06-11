@@ -4,6 +4,7 @@ use crate::models::{ApiResponse, SensorReading, SensorType, PointCloudPoint, Con
 use crate::database::Database;
 use crate::alerts::AlertManager;
 use crate::algorithms;
+use crate::services::LoraIngestService;
 use chrono::{Utc, Duration};
 use rand::Rng;
 use log::info;
@@ -46,6 +47,7 @@ pub async fn lora_uplink(
     db: web::Data<Database>,
     alert_mgr: web::Data<AlertManager>,
     gw: web::Data<crate::lora_gateway::LoraGateway>,
+    ingest_svc: web::Data<LoraIngestService>,
     reading: web::Json<SensorReading>,
 ) -> impl Responder {
     let mut reading = reading.into_inner();
@@ -65,25 +67,10 @@ pub async fn lora_uplink(
 
     let alerts = alert_mgr.check_and_alert(&reading);
 
-    match db.write_sensor_reading(&reading).await {
+    match ingest_svc.ingest_reading(reading.clone()).await {
         Ok(_) => {
             info!("LoRa数据接收成功: {}={:.3} @ ({},{})",
                 reading.sensor_type, reading.value, reading.grid_x, reading.grid_y);
-
-            if reading.sensor_type == SensorType::PH && reading.temperature.is_some() {
-                let relic_id = reading.relic_id.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-                let analysis = algorithms::perform_full_analysis(
-                    &relic_id,
-                    reading.grid_x,
-                    reading.grid_y,
-                    reading.value,
-                    reading.temperature.unwrap(),
-                    0.0,
-                    0.0,
-                    3.0,
-                );
-                let _ = db.write_corrosion_analysis(&analysis).await;
-            }
 
             let downlinks = gw.get_pending_for_device(&reading.sensor_id);
 
@@ -93,12 +80,13 @@ pub async fn lora_uplink(
                 "alerts_triggered": alerts.len(),
                 "alerts": alerts,
                 "downlinks": downlinks,
-                "downlink_count": downlinks.len()
+                "downlink_count": downlinks.len(),
+                "pipeline": "lora_ingest → collagen_kinetics → ca_balance → alerter"
             });
-            HttpResponse::Ok().json(ApiResponse::ok(resp_data, "LoRa数据已入库"))
+            HttpResponse::Ok().json(ApiResponse::ok(resp_data, "LoRa数据已入库，分析管道已启动"))
         }
         Err(e) => HttpResponse::InternalServerError()
-            .json(ApiResponse::<()>::error(&format!("写入数据库失败: {:?}", e))),
+            .json(ApiResponse::<()>::error(&format!("数据接入失败: {}", e))),
     }
 }
 
@@ -106,12 +94,15 @@ pub async fn lora_uplink(
 pub async fn lora_batch_uplink(
     db: web::Data<Database>,
     alert_mgr: web::Data<AlertManager>,
+    ingest_svc: web::Data<LoraIngestService>,
     readings: web::Json<Vec<SensorReading>>,
 ) -> impl Responder {
     let mut total = 0;
     let mut total_alerts = 0;
-    let readings = readings.into_inner();
-    for mut reading in readings {
+    let mut readings = readings.into_inner();
+    let mut processed_readings = Vec::new();
+
+    for reading in readings.iter_mut() {
         if reading.timestamp.is_none() {
             reading.timestamp = Some(Utc::now());
         }
@@ -124,15 +115,25 @@ pub async fn lora_batch_uplink(
             reading.depth = sensor_info.depth;
             reading.sensor_type = sensor_info.sensor_type;
         }
-        let alerts = alert_mgr.check_and_alert(&reading);
+        let alerts = alert_mgr.check_and_alert(reading);
         total_alerts += alerts.len();
-        if db.write_sensor_reading(&reading).await.is_ok() {
-            total += 1;
+        processed_readings.push(reading.clone());
+    }
+
+    match ingest_svc.ingest_batch(&processed_readings).await {
+        Ok(count) => {
+            total = count;
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .json(ApiResponse::<()>::error(&format!("批量接入失败: {}", e)));
         }
     }
+
     let data = serde_json::json!({
         "received": total,
-        "alerts_triggered": total_alerts
+        "alerts_triggered": total_alerts,
+        "pipeline": "lora_ingest → collagen_kinetics → ca_balance → alerter"
     });
     HttpResponse::Ok().json(ApiResponse::ok(data, &format!("批量接收{}条数据", total)))
 }
