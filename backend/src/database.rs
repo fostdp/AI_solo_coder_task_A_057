@@ -70,6 +70,55 @@ impl Database {
         }
     }
 
+    pub async fn verify_connection(&self) -> Result<(), String> {
+        match self.client.ping().await {
+            Ok((build, version)) => {
+                info!("InfluxDB连接验证成功: build={}, version={}", build, version);
+                Ok(())
+            }
+            Err(InfluxError::FetchError { status, .. }) => {
+                let msg = match status {
+                    Some(401) => "InfluxDB认证失败(401): 用户名或密码错误，请检查INFLUXDB_USER/INFLUXDB_PASS环境变量".to_string(),
+                    Some(403) => "InfluxDB权限不足(403): 当前用户无写入权限".to_string(),
+                    Some(404) => "InfluxDB数据库不存在(404): 请先创建数据库或检查INFLUXDB_DB配置".to_string(),
+                    Some(code) => format!("InfluxDB返回错误状态码({}): 请检查服务配置", code),
+                    None => "InfluxDB连接失败: 无法建立到服务器的连接，请检查INFLUXDB_URL和InfluxDB服务状态".to_string(),
+                };
+                error!("{}", msg);
+                Err(msg)
+            }
+            Err(e) => {
+                let msg = format!("InfluxDB连接异常: {:?}", e);
+                error!("{}", msg);
+                Err(msg)
+            }
+        }
+    }
+
+    fn classify_write_error(&self, err: &InfluxError) -> String {
+        match err {
+            InfluxError::FetchError { status: Some(401), .. } => {
+                "InfluxDB认证失败(401): 写入凭证无效".to_string()
+            }
+            InfluxError::FetchError { status: Some(403), .. } => {
+                "InfluxDB权限不足(403): 当前用户无写入权限，请授予writer角色".to_string()
+            }
+            InfluxError::FetchError { status: Some(404), .. } => {
+                "InfluxDB数据库不存在(404): 写入目标数据库不存在".to_string()
+            }
+            InfluxError::FetchError { status: Some(400), .. } => {
+                "InfluxDB请求格式错误(400): 数据模型与Schema不匹配".to_string()
+            }
+            InfluxError::FetchError { status: Some(code), .. } if *code >= 500 => {
+                format!("InfluxDB服务端错误({}): 数据库服务可能过载或异常", code)
+            }
+            InfluxError::FetchError { status: None, .. } => {
+                "InfluxDB连接中断: 写入时无法连接服务器".to_string()
+            }
+            _ => format!("InfluxDB写入失败: {:?}", err),
+        }
+    }
+
     pub async fn init_default_data(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut relics = self.relics.write();
         for i in 1..=500 {
@@ -171,7 +220,8 @@ impl Database {
         match self.client.query(query).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                error!("写入传感器数据失败: {:?}", e);
+                let classified = self.classify_write_error(&e);
+                error!("写入传感器数据失败: {} | 原始错误: {:?}", classified, e);
                 Err(e)
             }
         }
@@ -200,7 +250,14 @@ impl Database {
             risk_level: analysis.risk_level.clone(),
         };
         let query = influx_data.into_query("corrosion_analysis");
-        self.client.query(query).await
+        match self.client.query(query).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let classified = self.classify_write_error(&e);
+                error!("写入腐蚀分析失败: {} | 原始错误: {:?}", classified, e);
+                Err(e)
+            }
+        }
     }
 
     pub async fn query_sensor_history(
