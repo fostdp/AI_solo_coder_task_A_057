@@ -60,15 +60,46 @@ function initThreeScene(containerId) {
     const infoSprites = new THREE.Group();
     scene.add(infoSprites);
 
-    function animate() {
+    let dirty = true;
+    let lastInteractionTime = 0;
+    const IDLE_THRESHOLD_MS = 5000;
+    const STATIC_FRAME_INTERVAL = 2000;
+    let lastStaticRender = 0;
+
+    controls.addEventListener('change', () => {
+        dirty = true;
+        lastInteractionTime = performance.now();
+    });
+
+    function animate(time) {
         animationId = requestAnimationFrame(animate);
-        controls.update();
-        const t = performance.now() * 0.001;
-        pointLight.position.x = Math.sin(t * 0.3) * 8;
-        pointLight.position.z = Math.cos(t * 0.3) * 8;
-        renderer.render(scene, camera);
+
+        const timeSinceInteraction = time - lastInteractionTime;
+        const isInteracting = timeSinceInteraction < 200;
+        const pointLightMoving = true;
+
+        if (isInteracting || dirty || pointLightMoving) {
+            controls.update();
+            const t = time * 0.001;
+            pointLight.position.x = Math.sin(t * 0.3) * 8;
+            pointLight.position.z = Math.cos(t * 0.3) * 8;
+            renderer.render(scene, camera);
+            dirty = false;
+            lastStaticRender = time;
+        } else if (time - lastStaticRender > STATIC_FRAME_INTERVAL) {
+            controls.update();
+            const t = time * 0.001;
+            pointLight.position.x = Math.sin(t * 0.3) * 8;
+            pointLight.position.z = Math.cos(t * 0.3) * 8;
+            renderer.render(scene, camera);
+            lastStaticRender = time;
+        }
     }
-    animate();
+    animate(0);
+
+    function markDirty() {
+        dirty = true;
+    }
 
     function onResize() {
         const w = container.clientWidth;
@@ -76,13 +107,14 @@ function initThreeScene(containerId) {
         camera.aspect = w / h;
         camera.updateProjectionMatrix();
         renderer.setSize(w, h);
+        dirty = true;
     }
     window.addEventListener('resize', onResize);
 
     pointCloudRenderer = {
         scene, camera, renderer, controls,
         cloudGroup, infoSprites, container,
-        animationId, onResize,
+        animationId, onResize, markDirty,
         dispose() {
             cancelAnimationFrame(animationId);
             window.removeEventListener('resize', onResize);
