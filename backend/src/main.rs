@@ -2,7 +2,9 @@ mod models;
 mod database;
 mod algorithms;
 mod kinetics;
+mod ode;
 mod alerts;
+mod lora;
 mod lora_gateway;
 mod handlers;
 
@@ -29,6 +31,12 @@ async fn main() -> io::Result<()> {
     let influx_pass = env::var("INFLUXDB_PASS").unwrap_or_else(|_| "writer_relic_2026".to_string());
 
     let db = database::Database::new(&influx_url, &influx_db, &influx_user, &influx_pass);
+
+    if let Err(e) = db.verify_connection().await {
+        eprintln!("⚠️  InfluxDB连接验证失败: {}", e);
+        eprintln!("    系统将继续启动，但数据写入功能将不可用");
+    }
+
     if let Err(e) = db.init_default_data().await {
         eprintln!("初始化默认数据警告: {:?}", e);
     }
@@ -36,8 +44,11 @@ async fn main() -> io::Result<()> {
     let alert_config = alerts::AlertConfig::default();
     let alert_manager = alerts::AlertManager::new(alert_config);
 
+    let lora_gw = lora_gateway::LoraGateway::new();
+
     let db_data = web::Data::new(db.clone());
     let alert_data = web::Data::new(alert_manager.clone());
+    let gw_data = web::Data::new(lora_gw.clone());
 
     let frontend_dir = PathBuf::from(env::var("FRONTEND_DIR")
         .unwrap_or_else(|_| "../frontend".to_string()));
