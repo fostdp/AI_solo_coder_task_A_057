@@ -311,6 +311,37 @@ fn send_batch(url: &str, readings: &[SensorReading]) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+fn poll_downlinks(url: &str, sensor_ids: &[String]) -> Vec<(String, Vec<lora::downlink::DownlinkFrame>)> {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut results = Vec::new();
+    for id in sensor_ids.iter().take(20) {
+        let endpoint = format!("{}/api/lora/downlink/for-device/{}", url, id);
+        match client.get(&endpoint).send() {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.text() {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                        let frames: Vec<lora::downlink::DownlinkFrame> = v
+                            .pointer("/data/downlinks")
+                            .and_then(|d| serde_json::from_value(d.clone()).ok())
+                            .unwrap_or_default();
+                        if !frames.is_empty() {
+                            results.push((id.clone(), frames));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    results
+}
+
 fn send_single(url: &str, reading: &SensorReading) -> Result<Vec<lora::downlink::DownlinkFrame>, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(time::Duration::from_secs(15))
@@ -397,7 +428,39 @@ fn main() {
 
         let send_result = if args.batch_mode {
             info!("批量发送到 {} ...", args.server_url);
-            send_batch(&args.server_url, &readings)
+            let batch_result = send_batch(&args.server_url, &readings);
+
+            let sensor_ids: Vec<String> = readings.iter().map(|r| r.sensor_id.clone()).collect();
+            let downlink_results = poll_downlinks(&args.server_url, &sensor_ids);
+            let mut total_dl = 0u32;
+            for (dev_eui, frames) in downlink_results {
+                if let Some(sensor) = sensors.iter_mut().find(|s| s.id == dev_eui) {
+                    for frame in &frames {
+                        let success = sensor.process_downlink(frame);
+                        if success {
+                            total_dl += 1;
+                            let ack = lora::downlink::AckFrame {
+                                dev_eui: sensor.id.clone(),
+                                fcnt: frame.fcnt,
+                                ack_fcnt: frame.fcnt,
+                                port: frame.port,
+                                success: true,
+                                result: Some("OK".to_string()),
+                                rssi: Some(sensor.rssi_value()),
+                                timestamp: Some(Utc::now().to_rfc3339()),
+                            };
+                            if let Err(e) = send_ack(&args.server_url, &ack) {
+                                warn!("批量模式ACK失败 FCNT#{}: {}", frame.fcnt, e);
+                            }
+                        }
+                    }
+                }
+            }
+            if total_dl > 0 {
+                info!("批量模式处理下行{}条", total_dl);
+            }
+
+            batch_result
         } else {
             let mut oks = 0u32;
             let mut errs = 0u32;
