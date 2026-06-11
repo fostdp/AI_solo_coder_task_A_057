@@ -373,7 +373,7 @@ function bindPointCloudControls() {
         loadRelicPointCloud(e.target.value);
     });
     document.getElementById('color-mode')?.addEventListener('change', () => loadRelicPointCloud(GLOBAL_STATE.currentRelicId, true));
-    document.getElementById('reset-view')?.addEventListener('click', resetThreeView);
+    document.getElementById('reset-view')?.addEventListener('click', () => BoneCloud.resetView());
 }
 
 function bindContourControls() {
@@ -398,7 +398,7 @@ async function batchAlertsAction(action) {
 }
 
 function onTabRelic() {
-    initThreeScene('three-container');
+    BoneCloud.init('three-container');
     loadRelicPointCloud(GLOBAL_STATE.currentRelicId || GLOBAL_STATE.relics[0]?.id);
 }
 
@@ -408,7 +408,7 @@ async function loadRelicPointCloud(relicId, useExistingData = false) {
         const resp = await API.get(`/api/pointcloud/${relicId}`, { limit: 5000 });
         if (resp?.success && resp.data) {
             const colorMode = document.getElementById('color-mode')?.value || 'depth';
-            const summary = renderPointCloud(resp.data.points || [], colorMode);
+            const summary = BoneCloud.render(resp.data.points || [], colorMode);
             updateRelicDetail(relicId, summary);
             updateColorBar(colorMode);
         }
