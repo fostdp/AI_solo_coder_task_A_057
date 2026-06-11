@@ -1,4 +1,5 @@
 use crate::models::CorrosionAnalysis;
+use crate::kinetics;
 use chrono::Utc;
 
 pub const GAS_CONSTANT_R: f64 = 8.314;
@@ -248,8 +249,24 @@ pub fn perform_full_analysis(
     orp_mv: f64,
     elapsed_months: f64,
 ) -> CorrosionAnalysis {
-    let coll_rate = collagen_hydrolysis_rate(temperature, pH, orp_mv, None);
+    let arr_cfg = ArrheniusConfig::default();
+    let mm_cfg = kinetics::MichaelisMentenConfig::default();
+
+    let k_abiotic = collagen_hydrolysis_rate(temperature, pH, orp_mv, Some(&arr_cfg));
+
+    let microbial_biomass = estimate_microbial_biomass(temperature, pH, orp_mv);
+    let substrate_conc = 1.0;
+    let k_enzyme = kinetics::enzyme_hydrolysis_rate(
+        substrate_conc, microbial_biomass, temperature, pH, &mm_cfg,
+    );
+
+    let coll_rate = k_abiotic + k_enzyme;
     let coll_deg_pct = expected_collagen_deg_elapsed_months(coll_rate, elapsed_months);
+
+    let enzyme_contribution_pct = if coll_rate > 0.0 {
+        (k_enzyme / coll_rate) * 100.0
+    } else { 0.0 };
+
     let elapsed_days = elapsed_months * 30.0;
     let ca_pred = ca_p_ratio_predicted(pH, temperature, elapsed_days, None);
     let diss_rate = dissolution_rate(pH, temperature, ca_ppm, 0.5, &CalciumPhosphateConfig::default());
@@ -267,6 +284,10 @@ pub fn perform_full_analysis(
         orp: orp_mv,
         collagen_deg_rate: coll_rate,
         collagen_deg_percent: coll_deg_pct,
+        abiotic_rate: k_abiotic,
+        enzyme_rate: k_enzyme,
+        enzyme_contribution_pct,
+        microbial_biomass,
         ca_p_ratio: if ca_ppm > 0.0 {
             let ca_cfg = CalciumPhosphateConfig::default();
             let ca_mg = ca_ppm * 0.5;
@@ -279,6 +300,38 @@ pub fn perform_full_analysis(
         risk_level: risk,
         timestamp: Utc::now(),
     }
+}
+
+pub fn estimate_microbial_biomass(temp_celsius: f64, ph: f64, orp_mv: f64) -> f64 {
+    let temp_factor = {
+        let t_opt = 28.0;
+        if temp_celsius < 0.0 {
+            0.05
+        } else if temp_celsius <= t_opt {
+            0.1 + 0.9 * (temp_celsius / t_opt).powf(1.5)
+        } else if temp_celsius < 45.0 {
+            let excess = temp_celsius - t_opt;
+            let decline = (-excess / 12.0).exp();
+            1.0 * decline
+        } else {
+            0.1
+        }
+    };
+
+    let ph_factor = {
+        let ph_opt = 6.5;
+        let delta = (ph - ph_opt).abs();
+        (-delta * delta / (2.0 * 2.0 * 2.0)).exp()
+    };
+
+    let orp_factor = {
+        let opt_orp = -50.0;
+        let delta = (orp_mv - opt_orp).abs();
+        (-delta / 400.0).exp()
+    };
+
+    let base_biomass = 0.15;
+    base_biomass * temp_factor * ph_factor * orp_factor
 }
 
 #[cfg(test)]
