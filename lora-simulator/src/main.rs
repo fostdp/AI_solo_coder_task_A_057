@@ -7,6 +7,8 @@ use std::collections::HashMap;
 use std::thread;
 use std::time;
 
+mod lora;
+
 #[derive(Parser, Debug)]
 #[command(name = "LoRa电极模拟器", version, about = "模拟pH/ORP/Ca2+电极通过LoRa上报数据")]
 struct Args {
@@ -83,6 +85,9 @@ struct VirtualSensor {
     accumulated_hours: f64,
     anomaly_mode: bool,
     anomaly_remaining: u32,
+    sample_interval_secs: u64,
+    tx_power_dbm: i32,
+    datarate: String,
 }
 
 impl VirtualSensor {
@@ -112,6 +117,9 @@ impl VirtualSensor {
             accumulated_hours: 0.0,
             anomaly_mode: false,
             anomaly_remaining: 0,
+            sample_interval_secs: 1800,
+            tx_power_dbm: 14,
+            datarate: "SF7BW125".to_string(),
         }
     }
 
@@ -185,6 +193,54 @@ impl VirtualSensor {
         base + rng.gen_range(-10..5)
     }
 
+    fn process_downlink(&mut self, frame: &lora::downlink::DownlinkFrame) -> bool {
+        use lora::downlink::DownlinkCommand;
+        match frame.command {
+            DownlinkCommand::SET_SAMPLE_INTERVAL => {
+                if let Some(ival) = frame.payload.get("interval_secs")
+                    .and_then(|v| v.as_u64())
+                {
+                    self.sample_interval_secs = ival;
+                    info!("{}: 下行配置已更新 - 采样间隔={}s", self.id, ival);
+                    true
+                } else { false }
+            }
+            DownlinkCommand::SET_TX_POWER => {
+                if let Some(pw) = frame.payload.get("power_dbm")
+                    .and_then(|v| v.as_i64())
+                {
+                    self.tx_power_dbm = pw as i32;
+                    info!("{}: 下行配置已更新 - 发射功率={}dBm", self.id, pw);
+                    true
+                } else { false }
+            }
+            DownlinkCommand::SET_DATARATE => {
+                if let Some(dr) = frame.payload.get("datarate")
+                    .and_then(|v| v.as_str())
+                {
+                    self.datarate = dr.to_string();
+                    info!("{}: 下行配置已更新 - 数据速率={}", self.id, dr);
+                    true
+                } else { false }
+            }
+            DownlinkCommand::QUERY_STATUS => {
+                info!("{}: 状态查询 - 电量={:.1}%, 间隔={}s", self.id, self.battery, self.sample_interval_secs);
+                true
+            }
+            DownlinkCommand::RESET_DEVICE => {
+                warn!("{}: 收到复位命令，模拟复位", self.id);
+                self.sample_interval_secs = 1800;
+                self.tx_power_dbm = 14;
+                self.datarate = "SF7BW125".to_string();
+                true
+            }
+            _ => {
+                warn!("{}: 未知下行命令: {:?}", self.id, frame.command);
+                false
+            }
+        }
+    }
+
     fn read(&mut self, interval_secs: u64, anomaly_prob: f64) -> SensorReading {
         let hours = interval_secs as f64 / 3600.0;
         let value = self.next_value(hours, anomaly_prob);
@@ -255,7 +311,7 @@ fn send_batch(url: &str, readings: &[SensorReading]) -> Result<(), Box<dyn std::
     Ok(())
 }
 
-fn send_single(url: &str, reading: &SensorReading) -> Result<(), Box<dyn std::error::Error>> {
+fn send_single(url: &str, reading: &SensorReading) -> Result<Vec<lora::downlink::DownlinkFrame>, Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::builder()
         .timeout(time::Duration::from_secs(15))
         .build()?;
@@ -264,6 +320,25 @@ fn send_single(url: &str, reading: &SensorReading) -> Result<(), Box<dyn std::er
     if !resp.status().is_success() {
         let body = resp.text().unwrap_or_default();
         return Err(format!("HTTP {}: {}", resp.status(), body).into());
+    }
+    let body = resp.text().unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(&body)?;
+    let downlinks: Vec<lora::downlink::DownlinkFrame> = v
+        .pointer("/data/downlinks")
+        .and_then(|d| serde_json::from_value(d.clone()).ok())
+        .unwrap_or_default();
+    Ok(downlinks)
+}
+
+fn send_ack(url: &str, ack: &lora::downlink::AckFrame) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(time::Duration::from_secs(10))
+        .build()?;
+    let endpoint = format!("{}/api/lora/ack", url);
+    let resp = client.post(&endpoint).json(ack).send()?;
+    if !resp.status().is_success() {
+        let body = resp.text().unwrap_or_default();
+        return Err(format!("ACK HTTP {}: {}", resp.status(), body).into());
     }
     Ok(())
 }
@@ -326,11 +401,39 @@ fn main() {
         } else {
             let mut oks = 0u32;
             let mut errs = 0u32;
+            let mut total_downlinks = 0u32;
             for (i, reading) in readings.iter().enumerate() {
                 let delay = time::Duration::from_millis(rand::thread_rng().gen_range(0..15));
                 thread::sleep(delay);
                 match send_single(&args.server_url, reading) {
-                    Ok(_) => oks += 1,
+                    Ok(downlinks) => {
+                        oks += 1;
+                        if !downlinks.is_empty() {
+                            if let Some(sensor) = sensors.iter_mut().find(|s| s.id == reading.sensor_id) {
+                                for frame in &downlinks {
+                                    let success = sensor.process_downlink(frame);
+                                    if success {
+                                        total_downlinks += 1;
+                                        let ack = lora::downlink::AckFrame {
+                                            dev_eui: sensor.id.clone(),
+                                            fcnt: frame.fcnt,
+                                            ack_fcnt: frame.fcnt,
+                                            port: frame.port,
+                                            success: true,
+                                            result: Some("OK".to_string()),
+                                            rssi: Some(sensor.rssi_value()),
+                                            timestamp: Some(Utc::now().to_rfc3339()),
+                                        };
+                                        if let Err(e) = send_ack(&args.server_url, &ack) {
+                                            warn!("ACK发送失败 FCNT#{}: {}", frame.fcnt, e);
+                                        } else {
+                                            debug!("ACK已发送 FCNT#{}", frame.fcnt);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
                         errs += 1;
                         if errs <= 5 {
@@ -339,7 +442,7 @@ fn main() {
                     }
                 }
             }
-            info!("单条发送完成: 成功{} / 失败{}", oks, errs);
+            info!("单条发送完成: 成功{} / 失败{}，处理下行{}条", oks, errs, total_downlinks);
             if errs == 0 { Ok(()) } else { Err(format!("{}条失败", errs).into()) }
         };
 
